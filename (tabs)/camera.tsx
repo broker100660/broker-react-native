@@ -2,13 +2,103 @@ import React, { useRef, useState, useEffect } from 'react';
 import { View, TouchableOpacity, StyleSheet, Text, ActivityIndicator, BackHandler, GestureResponderEvent } from 'react-native';
 import { CameraView, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
 import { VideoView, useVideoPlayer } from 'expo-video';
-import { Audio } from 'expo-av'; // ✅ NEW — for mic mode control
+import { Audio } from 'expo-av';
 import * as FileSystem from 'expo-file-system/legacy';
 import { router } from 'expo-router';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { AppState } from 'react-native';
 const MAX_DURATION = 180; // 3 minutes
 
+// =========================
+// PREVIEW SCREEN
+// Crash fix: this component (and therefore useVideoPlayer) is only
+// ever mounted by the parent when a real, non-null video URI exists
+// (see MAIN RETURN in CameraScreen below). Previously useVideoPlayer
+// was called unconditionally at the top of CameraScreen with
+// `previewUri || ''`, so on every mount of the camera screen — before
+// any recording existed — the native player was initialised against
+// an empty string placeholder, which crashes the native video surface.
+// Extracting this into its own component means the player is created
+// only once `uri` is a real file path, and is fully torn down
+// (unmounted) the moment previewVisible/previewUri clears.
+// =========================
+const VideoPreviewScreen = React.memo(function VideoPreviewScreen({
+  uri,
+  onReRecord,
+  onUseVideo,
+  onExit,
+}: {
+  uri: string;
+  onReRecord: () => void;
+  onUseVideo: () => void;
+  onExit: () => void;
+}) {
+  const player = useVideoPlayer(uri, (p) => {
+    p.loop = false;
+  });
+
+  useEffect(() => {
+    return () => {
+      try { player.pause(); } catch (e) {}
+    };
+  }, [player]);
+
+  return (
+    <View style={{ flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' }}>
+      <Text style={{ color: '#fff', fontSize: 17, fontWeight: '700', marginBottom: 20 }}>
+        Preview your video
+      </Text>
+
+      <VideoView
+        player={player}
+        style={{ width: '100%', height: 360 }}
+        fullscreenOptions={{ supportsPictureInPicture: true }}
+        contentFit="contain"
+      />
+
+      <View style={{ flexDirection: 'row', gap: 14, marginTop: 20 }}>
+        <TouchableOpacity
+          onPress={() => player.play()}
+          style={{ backgroundColor: '#C4A484', paddingHorizontal: 22, paddingVertical: 11, borderRadius: 8 }}
+        >
+          <Text style={{ color: '#fff', fontWeight: '700' }}>▶ Play</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={() => player.pause()}
+          style={{ backgroundColor: '#444', paddingHorizontal: 22, paddingVertical: 11, borderRadius: 8 }}
+        >
+          <Text style={{ color: '#fff', fontWeight: '700' }}>⏸ Pause</Text>
+        </TouchableOpacity>
+      </View>
+
+      <View style={{ flexDirection: 'row', gap: 14, marginTop: 28 }}>
+        <TouchableOpacity
+          onPress={onReRecord}
+          style={{ borderWidth: 1.5, borderColor: '#fff', paddingHorizontal: 28, paddingVertical: 13, borderRadius: 8 }}
+        >
+          <Text style={{ color: '#fff', fontWeight: '700', fontSize: 15 }}>🔄 Re-record</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={onUseVideo}
+          style={{ backgroundColor: '#C4A484', paddingHorizontal: 28, paddingVertical: 13, borderRadius: 8 }}
+        >
+          <Text style={{ color: '#fff', fontWeight: '700', fontSize: 15 }}>✓ Use Video</Text>
+        </TouchableOpacity>
+      </View>
+
+      <TouchableOpacity
+        onPress={onExit}
+        style={{ marginTop: 20, paddingHorizontal: 20, paddingVertical: 10 }}
+      >
+        <Text style={{ color: '#aaa', fontSize: 13 }}>✕ Cancel & go back</Text>
+      </TouchableOpacity>
+    </View>
+  );
+});
+
+// =========================
+// MAIN COMPONENT
+// =========================
 export default function CameraScreen() {
   const cameraRef = useRef<CameraView | null>(null);
   const [permission, requestPermission] = useCameraPermissions();
@@ -30,25 +120,22 @@ export default function CameraScreen() {
   const [previewVisible, setPreviewVisible] = useState(false);
   const [processing, setProcessing] = useState(false);
 
-  const player = useVideoPlayer(previewUri || '', (p) => {
-    p.loop = false;
-  });
   useEffect(() => {
-   activateKeepAwakeAsync();
+    activateKeepAwakeAsync();
     return () => {
       deactivateKeepAwake();
       clearInterval(timerRef.current);
-      try { player.pause(); } catch (e) {}
     };
   }, []);
-useEffect(() => {
-  const sub = AppState.addEventListener('change', (state) => {
-    if (state === 'background' && isRecording.current) {
-      stopRecording();
-    }
-  });
-  return () => sub.remove();
-}, []);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'background' && isRecording.current) {
+        stopRecording();
+      }
+    });
+    return () => sub.remove();
+  }, []);
 
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
@@ -80,7 +167,6 @@ useEffect(() => {
   }
 
   const exitCamera = async () => {
-    try { player.pause(); } catch (e) {}
     const uriToDelete = previewUri;
     setPreviewVisible(false);
     setPreviewUri(null);
@@ -172,19 +258,19 @@ useEffect(() => {
   const startRecording = async () => {
     if (!cameraRef.current || isRecording.current) return;
 
-    // ✅ Auto-enable torch on recording start — back camera only, front has no flash
+    // Auto-enable torch on recording start — back camera only, front has no flash
     if (facing === 'back' && !torchOn) {
       setTorchOn(true);
     }
 
-    // ✅ Force the phone's camcorder mic — prevents wrong mic being picked (earpiece/Bluetooth)
+    // Force the phone's camcorder mic — prevents wrong mic being picked (earpiece/Bluetooth)
     await Audio.setAudioModeAsync({
       allowsRecordingIOS: true,
       playsInSilentModeIOS: true,
       interruptionModeIOS: 1,
       shouldDuckAndroid: false,
       interruptionModeAndroid: 1,
-      playThroughEarpieceAndroid: false, // ← forces main camcorder mic on Android
+      playThroughEarpieceAndroid: false, // forces main camcorder mic on Android
     });
 
     isRecording.current = true;
@@ -197,9 +283,9 @@ useEffect(() => {
         maxDuration: MAX_DURATION,
         videoQuality: '480p',
         videoBitrate: 1_200_000,      // 1.2Mbps — good quality, ~27MB for 3min
-        numberOfAudioChannels: 1,      // ✅ mono — significantly reduces ambient noise pickup
-        audioSampleRate: 44100,        // ✅ standard sample rate for clear voice
-        audioBitRate: 128000,          // ✅ 128kbps — clear voice without excess size
+        numberOfAudioChannels: 1,      // mono — significantly reduces ambient noise pickup
+        audioSampleRate: 44100,        // standard sample rate for clear voice
+        audioBitRate: 128000,          // 128kbps — clear voice without excess size
       });
 
       stopTimer();
@@ -238,7 +324,7 @@ useEffect(() => {
 
   const stopRecording = () => {
     cameraRef.current?.stopRecording();
-    // ✅ Reset audio mode back to normal after recording stops
+    // Reset audio mode back to normal after recording stops
     Audio.setAudioModeAsync({
       allowsRecordingIOS: false,
       playsInSilentModeIOS: false,
@@ -259,7 +345,6 @@ useEffect(() => {
   };
 
   const handleUseVideo = () => {
-    try { player.pause(); } catch (e) {}
     const uriToSend = previewUri!;
     setPreviewUri(null);
     setPreviewVisible(false);
@@ -270,7 +355,6 @@ useEffect(() => {
   };
 
   const handleReRecord = async () => {
-    try { player.pause(); } catch (e) {}
     if (previewUri) {
       try {
         const info = await FileSystem.getInfoAsync(previewUri);
@@ -300,57 +384,17 @@ useEffect(() => {
     );
   }
 
+  // Crash fix: VideoPreviewScreen (and its useVideoPlayer call) is only
+  // ever mounted here, when previewUri is guaranteed to be a real,
+  // non-null file path — never against an empty-string placeholder.
   if (previewVisible && previewUri) {
     return (
-      <View style={{ flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' }}>
-        <Text style={{ color: '#fff', fontSize: 17, fontWeight: '700', marginBottom: 20 }}>
-          Preview your video
-        </Text>
-
-        <VideoView
-          player={player}
-          style={{ width: '100%', height: 360 }}
-          fullscreenOptions={{ supportsPictureInPicture: true }}
-          contentFit="contain"
-        />
-
-        <View style={{ flexDirection: 'row', gap: 14, marginTop: 20 }}>
-          <TouchableOpacity
-            onPress={() => player.play()}
-            style={{ backgroundColor: '#C4A484', paddingHorizontal: 22, paddingVertical: 11, borderRadius: 8 }}
-          >
-            <Text style={{ color: '#fff', fontWeight: '700' }}>▶ Play</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            onPress={() => player.pause()}
-            style={{ backgroundColor: '#444', paddingHorizontal: 22, paddingVertical: 11, borderRadius: 8 }}
-          >
-            <Text style={{ color: '#fff', fontWeight: '700' }}>⏸ Pause</Text>
-          </TouchableOpacity>
-        </View>
-
-        <View style={{ flexDirection: 'row', gap: 14, marginTop: 28 }}>
-          <TouchableOpacity
-            onPress={handleReRecord}
-            style={{ borderWidth: 1.5, borderColor: '#fff', paddingHorizontal: 28, paddingVertical: 13, borderRadius: 8 }}
-          >
-            <Text style={{ color: '#fff', fontWeight: '700', fontSize: 15 }}>🔄 Re-record</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            onPress={handleUseVideo}
-            style={{ backgroundColor: '#C4A484', paddingHorizontal: 28, paddingVertical: 13, borderRadius: 8 }}
-          >
-            <Text style={{ color: '#fff', fontWeight: '700', fontSize: 15 }}>✓ Use Video</Text>
-          </TouchableOpacity>
-        </View>
-
-        <TouchableOpacity
-          onPress={exitCamera}
-          style={{ marginTop: 20, paddingHorizontal: 20, paddingVertical: 10 }}
-        >
-          <Text style={{ color: '#aaa', fontSize: 13 }}>✕ Cancel & go back</Text>
-        </TouchableOpacity>
-      </View>
+      <VideoPreviewScreen
+        uri={previewUri}
+        onReRecord={handleReRecord}
+        onUseVideo={handleUseVideo}
+        onExit={exitCamera}
+      />
     );
   }
 

@@ -78,9 +78,24 @@ export default function Home() {
   // ── Price search — only shown in the Active section. Non-destructive:
   // if a match exists in the currently displayed grid, scroll to it; if
   // not, leave the grid exactly as it is and just let the broker know.
+  //
+  // PERSISTENCE FIX: priceSearch is no longer cleared after a successful
+  // search — it stays exactly as typed until the broker edits it
+  // themselves, so they can keep re-searching the same price (e.g. after
+  // the list refreshes) without retyping it. highlightedId is no longer
+  // auto-cleared on a timer — the green border on the matched card now
+  // persists until the broker switches tabs (see the useEffect below),
+  // instead of silently disappearing after 3 seconds.
   const [priceSearch, setPriceSearch] = useState('');
-const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  const [highlightedId, setHighlightedId] = useState<string | null>(null);
   const gridRef = useRef<FlatList>(null);
+
+  // Leaving the current tab (RENT/LAND/PROPERTIES) counts as "leaving that
+  // page" — clear the green highlight then, but NOT on every re-render,
+  // refresh, or re-search within the same tab.
+  useEffect(() => {
+    setHighlightedId(null);
+  }, [activeTab]);
 
   const activeForSale = forSaleProperties.filter(p => p.computed_status === 'active');
   const staysForSale  = forSaleProperties.filter(p => p.computed_status === 'stays');
@@ -418,68 +433,73 @@ const [highlightedId, setHighlightedId] = useState<string | null>(null);
   // (already scoped to the active tab + Active filter). If found, scroll
   // to it. If not found, leave the grid untouched and just notify the
   // broker instead of clearing/replacing anything.
+  //
+  // PERSISTENCE FIX: previously this cleared priceSearch back to '' and
+  // auto-cleared highlightedId after 3 seconds — both removed. The typed
+  // price now stays in the box (so the broker can search it again after
+  // a refresh without retyping), and the green highlight now stays on
+  // the matched card until the broker switches tabs (handled by the
+  // useEffect on activeTab above), not on a timer.
   const handlePriceSearch = () => {
-  const query = priceSearch.trim().replace(/,/g, '');
-  if (!query) return;
+    const query = priceSearch.trim().replace(/,/g, '');
+    if (!query) return;
 
-  const numericQuery = Number(query);
-  if (isNaN(numericQuery) || numericQuery <= 0) {
-    Alert.alert('Invalid price', 'Enter a valid numeric price to search.');
-    return;
-  }
+    const numericQuery = Number(query);
+    if (isNaN(numericQuery) || numericQuery <= 0) {
+      Alert.alert('Invalid price', 'Enter a valid numeric price to search.');
+      return;
+    }
 
-  const matchIndex = currentData.findIndex((item: any) => {
-    const itemPrice = Number(String(item.price).replace(/,/g, ''));
-    return itemPrice === numericQuery;
-  });
+    const matchIndex = currentData.findIndex((item: any) => {
+      const itemPrice = Number(String(item.price).replace(/,/g, ''));
+      return itemPrice === numericQuery;
+    });
 
-  if (matchIndex === -1) {
-    Alert.alert('No match', 'No active property found with that exact price.');
-    return;
-  }
+    if (matchIndex === -1) {
+      Alert.alert('No match', 'No active property found with that exact price.');
+      return;
+    }
 
-  if (matchIndex >= currentData.length) {
-    Alert.alert('Try again', 'The list just updated — please search again.');
-    return;
-  }
+    if (matchIndex >= currentData.length) {
+      Alert.alert('Try again', 'The list just updated — please search again.');
+      return;
+    }
 
-  const matchedItem = currentData[matchIndex];
+    const matchedItem = currentData[matchIndex];
 
-  try {
-    gridRef.current?.scrollToIndex({ index: matchIndex, animated: true, viewPosition: 0.3 });
-  } catch (e) {
-    console.log('[SEARCH] scrollToIndex error:', e);
-  }
+    try {
+      gridRef.current?.scrollToIndex({ index: matchIndex, animated: true, viewPosition: 0.3 });
+    } catch (e) {
+      console.log('[SEARCH] scrollToIndex error:', e);
+    }
 
-  // Briefly highlight the exact matched card so there's zero ambiguity
-  // about which one scrolled into view, even with several visible at once.
-  setHighlightedId(matchedItem.id);
-  setTimeout(() => setHighlightedId(null), 3000);
-
-  setPriceSearch('');
-};
+    // Highlight the exact matched card so there's zero ambiguity about
+    // which one scrolled into view, even with several visible at once.
+    // Stays until the broker switches tabs — see the useEffect above.
+    setHighlightedId(matchedItem.id);
+  };
 
   // ================== RENDER ITEM ==================
   const renderItem = ({ item }: any) => {
-  const streamId  = getStreamId(item.video_url);
-  const thumbnail = `https://videodelivery.net/${streamId}/thumbnails/thumbnail.jpg?time=0`;
-  const isHighlighted = item.id === highlightedId;
-  return (
-    <TouchableOpacity
-      style={[
-        styles.card,
-        { backgroundColor: cardBg },
-        isHighlighted && { borderWidth: 3, borderColor: '#4CAF50' },
-      ]}
-      onPress={() => openProperty(item)}
-    >
-      <Image source={{ uri: thumbnail }} style={styles.thumbnail} />
-      <Text style={[styles.price, { color: text }]} numberOfLines={1}>
-        UGX {item.price}
-      </Text>
-    </TouchableOpacity>
-  );
-};
+    const streamId  = getStreamId(item.video_url);
+    const thumbnail = `https://videodelivery.net/${streamId}/thumbnails/thumbnail.jpg?time=0`;
+    const isHighlighted = item.id === highlightedId;
+    return (
+      <TouchableOpacity
+        style={[
+          styles.card,
+          { backgroundColor: cardBg },
+          isHighlighted && { borderWidth: 3, borderColor: '#4CAF50' },
+        ]}
+        onPress={() => openProperty(item)}
+      >
+        <Image source={{ uri: thumbnail }} style={styles.thumbnail} />
+        <Text style={[styles.price, { color: text }]} numberOfLines={1}>
+          UGX {item.price}
+        </Text>
+      </TouchableOpacity>
+    );
+  };
 
   if (!broker) {
     return (
@@ -576,7 +596,7 @@ const [highlightedId, setHighlightedId] = useState<string | null>(null);
 
         {/* ── PRICE SEARCH — Active section only. Scrolls to a match in
              the grid if the exact price exists; otherwise leaves the
-             grid untouched. ── */}
+             grid untouched. Value persists until the broker edits it. ── */}
         {currentFilter === 'active' && (
           <View style={[styles.searchRow, { borderBottomColor: borderColor }]}>
             <TextInput
