@@ -48,6 +48,21 @@ type PendingUpload = {
 };
 
 // =========================
+// NUMBER FORMATTING HELPER
+// Stored state always holds raw digits only (e.g. "1500000"), which is
+// what gets sent to the backend / DB. This helper is purely for what
+// the broker SEES in the box while typing — it never touches state.
+// =========================
+const formatWithCommas = (digitsOnly: string): string => {
+  if (!digitsOnly) return '';
+  const num = Number(digitsOnly);
+  if (Number.isNaN(num)) return '';
+  return num.toLocaleString('en-US');
+};
+
+const stripToDigits = (text: string): string => text.replace(/[^0-9]/g, '');
+
+// =========================
 // VIDEO PREVIEW MODAL
 // Crash fix: this component is now ONLY mounted by the parent when
 // a real, non-null video URI exists (see MAIN RETURN below), so the
@@ -165,13 +180,14 @@ export default function AddProperty() {
   const [sizeLength, setSizeLength] = useState('');       // e.g. 100
   const [propertyUsage, setPropertyUsage] = useState(''); // has_rental_units | residential_only (PROPERTIES tab)
 
+  // PROPERTIES-FOR-SALE — RENTAL INCOME FIELDS (shown only when
+  // propertyUsage === 'has_rental_units'). Stored as raw digits only,
+  // same rule as price. Maps to number_of_units / income_per_unit
+  // columns on properties_for_sale.
+  const [numberOfUnits, setNumberOfUnits] = useState('');
+  const [incomePerUnit, setIncomePerUnit] = useState('');
+
   // LAND EXTRA FIELDS
-  // Land re-uses price / areaType / dimensionUnit / sizeWidth / sizeLength /
-  // toMainRoad / transportToTown / propertyType / propertyUsage above, but
-  // its Property Type options (Plot/Estate) and Property Usage options
-  // (Rentals-Apartments/Residence/Shops) differ from the other tabs, and it
-  // has no Bedroom Type. It also uses "Owner" instead of "Landlord" contact
-  // fields, kept separate so RENT/PROPERTIES aren't affected.
   const [ownerName, setOwnerName] = useState('');
   const [ownerNumber, setOwnerNumber] = useState('');
 
@@ -190,21 +206,44 @@ export default function AddProperty() {
 
   // UPLOAD
   const [uploading, setUploading] = useState(false);
-  // Use only a ref for progress — avoids async state lag causing
-  // fillFlex/emptyFlex to both be 0 which crashes RN layout on Android
   const uploadProgressRef = useRef(0);
   const [uploadProgressDisplay, setUploadProgressDisplay] = useState(0);
   const [uploadStatus, setUploadStatus] = useState('');
   const [videoCloudUrl, setVideoCloudUrl] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  // Keep refs so AppState closure always sees latest values
   const uploadingRef = useRef(false);
   const selectedVideoRef = useRef<TrackedVideo | null>(null);
   const videoCloudUrlRef = useRef<string | null>(null);
 
   const videoUriHandled = useRef<string | null>(null);
+  // CRASH FIX: tracks whether a real video just arrived from the camera
+  // screen this mount, so checkPendingUpload() (below) can skip showing
+  // its "Resume Upload?" alert and potentially clobbering the fresh
+  // video with a stale one. Two competing "which video is active" flows
+  // racing on mount was a real state-corruption risk.
+  const incomingVideoThisMount = useRef(false);
+
   const params = useLocalSearchParams();
+
+  // CRASH FIX: expo-router can return a search param as a string[] instead
+  // of a string in some navigation edge cases. The old code did
+  // `params.videoUri as string` — a TypeScript-only cast that does NOT
+  // convert anything at runtime. If videoUri ever arrived as an array,
+  // that array itself got stored as TrackedVideo.uri, and later native
+  // calls like FileSystem.getInfoAsync(videoUri) would receive an array
+  // where they expect a string — native modules often throw at the
+  // bridge level for a type mismatch like this rather than rejecting the
+  // promise cleanly, which can crash the app outright. Normalizing to a
+  // single string (or null) here means nothing downstream ever sees
+  // anything else.
+  const rawVideoUriParam = params.videoUri;
+  const incomingVideoUri: string | null =
+    typeof rawVideoUriParam === 'string'
+      ? rawVideoUriParam
+      : Array.isArray(rawVideoUriParam) && typeof rawVideoUriParam[0] === 'string'
+      ? rawVideoUriParam[0]
+      : null;
 
   // Sync refs with state
   useEffect(() => { latRef.current = latitude; }, [latitude]);
@@ -213,25 +252,22 @@ export default function AddProperty() {
   useEffect(() => { selectedVideoRef.current = selectedVideo; }, [selectedVideo]);
   useEffect(() => { videoCloudUrlRef.current = videoCloudUrl; }, [videoCloudUrl]);
 
-  // Stable close handler for the memoized preview modal — created once
-  // so React.memo can actually skip re-renders on unrelated state changes
   const closePreviewModal = useCallback(() => setPreviewModal(false), []);
 
   // =========================
   // EFFECTS
   // =========================
 
-  // Handle video coming back from camera screen.
-  // Crash fix: don't call clearExpoTempVideos() on mount if a
-  // new video is incoming — that would delete it before we save it.
+  // Handle video coming back from camera screen. Now uses the
+  // normalized incomingVideoUri (always a real string or null) instead
+  // of the raw, possibly-array params.videoUri.
   useEffect(() => {
-    if (!params.videoUri) return;
-    if (videoUriHandled.current === params.videoUri) return;
-    videoUriHandled.current = params.videoUri as string;
+    if (!incomingVideoUri) return;
+    if (videoUriHandled.current === incomingVideoUri) return;
+    videoUriHandled.current = incomingVideoUri;
+    incomingVideoThisMount.current = true;
 
     (async () => {
-      // Restore the tab we were on before recording, since this
-      // screen may have reset activeTab back to its default
       try {
         const savedTab = await AsyncStorage.getItem('pending_tab');
         if (savedTab === 'RENT' || savedTab === 'LAND' || savedTab === 'PROPERTIES') {
@@ -243,7 +279,7 @@ export default function AddProperty() {
       }
 
       const newVideo: TrackedVideo = {
-        uri: params.videoUri as string,
+        uri: incomingVideoUri,
         createdAt: Date.now(),
         thumbnail: null,
         cloudUrl: null,
@@ -259,7 +295,7 @@ export default function AddProperty() {
 
       captureLocation();
     })();
-  }, [params.videoUri]);
+  }, [incomingVideoUri]);
 
   useEffect(() => {
     loadBroker();
@@ -267,14 +303,11 @@ export default function AddProperty() {
     loadSavedVideos();
     cleanOrphanedVideos();
     checkPendingUpload();
-    // Only clean temp files on normal mount (no incoming camera video)
-    if (!params.videoUri) {
+    if (!incomingVideoUri) {
       clearExpoTempVideos();
     }
   }, []);
 
-  // Save progress whenever app goes to background — using refs
-  // so the closure always captures current values, not stale state
   useEffect(() => {
     const sub = AppState.addEventListener('change', async (state) => {
       if (state === 'background') {
@@ -289,7 +322,7 @@ export default function AddProperty() {
       }
     });
     return () => sub.remove();
-  }, []); // Empty deps — intentional, we use refs above
+  }, []);
 
   // =========================
   // BROKER
@@ -303,11 +336,6 @@ export default function AddProperty() {
 
   // =========================
   // GPS
-  // Crash fix: High accuracy can hang indefinitely on Uganda
-  // networks. Race it against a 10s timeout then fall back to
-  // Balanced. On total failure recover last known coords from storage.
-  // Also persist coords immediately to AsyncStorage so a crash
-  // can't lose them.
   // =========================
   const captureLocation = async () => {
     try {
@@ -321,7 +349,6 @@ export default function AddProperty() {
       let loc: Location.LocationObject | null = null;
 
       try {
-        // Try high accuracy with a 10-second timeout
         loc = await Promise.race<Location.LocationObject>([
           Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }),
           new Promise<never>((_, reject) =>
@@ -329,7 +356,6 @@ export default function AddProperty() {
           ),
         ]);
       } catch {
-        // High accuracy timed out — fall back to Balanced (much faster)
         console.log('[LOCATION] High accuracy timed out, falling back to Balanced');
         try {
           loc = await Location.getCurrentPositionAsync({
@@ -348,7 +374,6 @@ export default function AddProperty() {
         latRef.current = lat;
         lngRef.current = lng;
         setLocationStatus('success');
-        // Persist immediately — crash-safe
         await AsyncStorage.setItem('last_gps', JSON.stringify({ latitude: lat, longitude: lng }));
         console.log('[LOCATION] Captured:', lat, lng);
       } else {
@@ -359,7 +384,6 @@ export default function AddProperty() {
       console.log('[LOCATION] captureLocation error:', e);
       setLocationStatus('error');
 
-      // Try to recover last known GPS from storage
       try {
         const saved = await AsyncStorage.getItem('last_gps');
         if (saved) {
@@ -476,6 +500,7 @@ export default function AddProperty() {
 
   const safeDeleteVideo = async (uri: string) => {
     try {
+      if (typeof uri !== 'string' || !uri) return;
       const isOurFile =
         uri.startsWith(FileSystem.cacheDirectory || '') ||
         uri.startsWith(FileSystem.documentDirectory || '');
@@ -500,9 +525,6 @@ export default function AddProperty() {
     } catch (e) { console.log('updateVideoStatus error:', e); }
   };
 
-  // Save pending upload state — includes GPS coordinates so a crash
-  // never loses them. Called before upload starts, after it completes,
-  // and whenever app goes to background.
   const savePendingUpload = async (
     videoUri: string,
     cloudUrl: string | null,
@@ -510,6 +532,7 @@ export default function AddProperty() {
     lng?: number | null,
   ) => {
     try {
+      if (typeof videoUri !== 'string' || !videoUri) return;
       const payload: PendingUpload = {
         videoUri,
         cloudUrl,
@@ -527,11 +550,28 @@ export default function AddProperty() {
     catch (e) { console.log('clearPendingUpload error:', e); }
   };
 
+  // CRASH FIX: skips the "Resume Upload?" flow entirely if a real video
+  // just arrived from the camera this mount (incomingVideoThisMount).
+  // Previously both flows could fire on the same mount — the camera-
+  // return effect above sets the fresh video, then this alert could
+  // pop and, if "Resume" was tapped, overwrite it with stale pending
+  // data, leaving refs and state out of sync in a way that could
+  // surface as a crash later during upload/submit. Also now guards
+  // against a malformed pending.videoUri (non-string) before it ever
+  // reaches FileSystem/native calls.
   const checkPendingUpload = async () => {
     try {
+      if (incomingVideoThisMount.current) return;
+
       const data = await AsyncStorage.getItem('pending_upload');
       if (!data) return;
       const pending: PendingUpload = JSON.parse(data);
+
+      if (typeof pending?.videoUri !== 'string' || !pending.videoUri) {
+        await clearPendingUpload();
+        return;
+      }
+
       const info = await FileSystem.getInfoAsync(pending.videoUri);
       if (!info.exists) { await clearPendingUpload(); return; }
 
@@ -558,7 +598,6 @@ export default function AddProperty() {
                 videoCloudUrlRef.current = pending.cloudUrl;
               }
 
-              // Restore saved GPS coordinates — never lost after crash
               if (pending.latitude != null && pending.longitude != null) {
                 setLatitude(pending.latitude);
                 setLongitude(pending.longitude);
@@ -593,7 +632,7 @@ export default function AddProperty() {
   };
 
   const saveToAppFolder = async (video: TrackedVideo): Promise<void> => {
-    if (!video?.uri) return;
+    if (!video?.uri || typeof video.uri !== 'string') return;
     try {
       const thumb = await generateThumbnail(video.uri);
       const newVideo: TrackedVideo = {
@@ -641,7 +680,7 @@ export default function AddProperty() {
 
   const selectFromAppFolder = async (video: TrackedVideo) => {
     try {
-      if (video.uri.startsWith('file://')) {
+      if (typeof video?.uri === 'string' && video.uri.startsWith('file://')) {
         const info = await FileSystem.getInfoAsync(video.uri);
         if (!info.exists) {
           Alert.alert(
@@ -715,10 +754,6 @@ export default function AddProperty() {
 
   // =========================
   // UPLOAD
-  // Progress crash fix: we drive the progress bar off a ref
-  // (uploadProgressRef) and only push to state for display.
-  // This prevents fillFlex + emptyFlex both being 0 at the same
-  // render, which crashes RN Android flex layout.
   // =========================
   const setProgress = (value: number) => {
     const clamped = Math.min(Math.max(Math.round(value), 0), 100);
@@ -727,8 +762,8 @@ export default function AddProperty() {
   };
 
   const uploadVideoToCloudflare = async (): Promise<string | null> => {
-    if (!selectedVideoRef.current?.uri) return null;
-    const videoUri = selectedVideoRef.current.uri;
+    const videoUri = selectedVideoRef.current?.uri;
+    if (typeof videoUri !== 'string' || !videoUri) return null;
 
     try {
       setUploading(true);
@@ -767,7 +802,6 @@ export default function AddProperty() {
         return null;
       }
 
-      // Save pending state BEFORE upload starts — includes current GPS
       await savePendingUpload(videoUri, null, latRef.current, lngRef.current);
       setUploadStatus('Uploading...');
 
@@ -793,7 +827,6 @@ export default function AddProperty() {
           },
         });
       } finally {
-        // Always clear interval — even on crash/throw
         if (progressInterval !== undefined) clearInterval(progressInterval);
       }
 
@@ -818,7 +851,6 @@ export default function AddProperty() {
       videoCloudUrlRef.current = previewUrl;
 
       await updateVideoStatus(videoUri, 'uploaded_to_cloudflare', previewUrl);
-      // Save again with cloudUrl + GPS so resume has everything
       await savePendingUpload(videoUri, previewUrl, latRef.current, lngRef.current);
 
       return previewUrl;
@@ -930,9 +962,12 @@ export default function AddProperty() {
     setSizeWidth('');
     setSizeLength('');
     setPropertyUsage('');
+    setNumberOfUnits('');
+    setIncomePerUnit('');
     setOwnerName('');
     setOwnerNumber('');
     videoUriHandled.current = null;
+    incomingVideoThisMount.current = false;
   };
 
   // =========================
@@ -946,9 +981,6 @@ export default function AddProperty() {
 
   const renderVideoBox = () => {
     if (uploading) {
-      // Crash fix: derive fill/empty from the ref, not async state.
-      // Use percentage-based width instead of flex so neither value
-      // can be 0 (which crashes RN Android flex layout).
       const pct = uploadProgressDisplay;
       return (
         <View style={[styles.uploadBox, { height: 180, justifyContent: 'center', paddingHorizontal: 24, borderStyle: 'solid' }]}>
@@ -1105,7 +1137,13 @@ export default function AddProperty() {
       <TextInput style={styles.input} value={village} onChangeText={setVillage} placeholder="Enter village" />
 
       <Text style={styles.label}>Price (UGX)</Text>
-      <TextInput style={styles.input} value={price} onChangeText={setPrice} keyboardType="numeric" placeholder="Enter price" />
+      <TextInput
+        style={styles.input}
+        value={formatWithCommas(price)}
+        onChangeText={(text) => setPrice(stripToDigits(text))}
+        keyboardType="numeric"
+        placeholder="Enter price"
+      />
 
       <Text style={styles.label}>Property Type</Text>
       <View style={styles.pickerWrapper}>
@@ -1189,12 +1227,14 @@ export default function AddProperty() {
 
   // =========================
   // SUBMIT PROPERTY FOR SALE
-  // Posts to its own route — Supabase table will be created separately
   // =========================
   const submitPropertyForSale = async () => {
     if (!broker) return Alert.alert('Error', 'No broker found. Please log in again.');
     if (!selectedVideo) return Alert.alert('Error', 'Please select a video first.');
     if (!propertyUsage) return Alert.alert('Required', 'Please select whether the property has rental units or is residential only.');
+    if (propertyUsage === 'has_rental_units' && (!numberOfUnits || !incomePerUnit)) {
+      return Alert.alert('Required', 'Please enter the number of units and income per unit.');
+    }
 
     let cloudUrl = videoCloudUrlRef.current;
     if (!cloudUrl) {
@@ -1214,6 +1254,8 @@ export default function AddProperty() {
         sizeWidth,
         sizeLength,
         propertyUsage,
+        number_of_units: propertyUsage === 'has_rental_units' ? numberOfUnits : null,
+        income_per_unit: propertyUsage === 'has_rental_units' ? incomePerUnit : null,
         videoURL: cloudUrl,
         latitude: latRef.current,
         longitude: lngRef.current,
@@ -1257,12 +1299,6 @@ export default function AddProperty() {
 
   // =========================
   // SUBMIT LAND
-  // Posts to its own route (mirrors submitPropertyForSale). Backend
-  // needs a matching POST /land-properties route + land_properties
-  // table, same shape as properties_for_sale, with property_type
-  // ('plot'|'estate'), property_usage ('rentals_apartments'|'residence'
-  // |'shops'), owner_name / owner_number instead of landlord_* , and
-  // no bedroom_type column.
   // =========================
   const submitLandProperty = async () => {
     if (!broker) return Alert.alert('Error', 'No broker found. Please log in again.');
@@ -1283,8 +1319,8 @@ export default function AddProperty() {
         brokerId: broker.id,
         country, region, district, subcounty, village,
         price,
-        propertyType,      // 'plot' | 'estate'
-        propertyUsage,     // 'rentals_apartments' | 'residence' | 'shops'
+        propertyType,
+        propertyUsage,
         areaType,
         dimensionUnit,
         sizeWidth,
@@ -1332,8 +1368,6 @@ export default function AddProperty() {
 
   // =========================
   // PROPERTIES FOR SALE FORM
-  // Same as rent form + areaType, dimensionUnit, sizeWidth × sizeLength
-  // inserted before propertyType
   // =========================
   const renderPropertiesForm = () => (
     <ScrollView style={styles.scrollContent} keyboardShouldPersistTaps="handled">
@@ -1394,9 +1428,14 @@ export default function AddProperty() {
       <TextInput style={styles.input} value={village} onChangeText={setVillage} placeholder="Enter village" />
 
       <Text style={styles.label}>Price (UGX)</Text>
-      <TextInput style={styles.input} value={price} onChangeText={setPrice} keyboardType="numeric" placeholder="Enter price" />
+      <TextInput
+        style={styles.input}
+        value={formatWithCommas(price)}
+        onChangeText={(text) => setPrice(stripToDigits(text))}
+        keyboardType="numeric"
+        placeholder="Enter price"
+      />
 
-      {/* ── NEW FIELDS ── */}
       <Text style={styles.label}>Area Type</Text>
       <View style={styles.pickerWrapper}>
         <Picker mode="dropdown" selectedValue={areaType} onValueChange={setAreaType}>
@@ -1443,7 +1482,6 @@ export default function AddProperty() {
           {sizeWidth} × {sizeLength} {dimensionUnit || ''}
         </Text>
       ) : null}
-      {/* ── END NEW FIELDS ── */}
 
       <Text style={styles.label}>Property Type</Text>
       <View style={styles.pickerWrapper}>
@@ -1459,7 +1497,20 @@ export default function AddProperty() {
         Property Usage <Text style={{ color: '#e53935' }}>*</Text>
       </Text>
       <View style={styles.pickerWrapper}>
-        <Picker mode="dropdown" selectedValue={propertyUsage} onValueChange={setPropertyUsage}>
+        <Picker
+          mode="dropdown"
+          selectedValue={propertyUsage}
+          onValueChange={(v) => {
+            setPropertyUsage(v);
+            // Clear rental-income fields whenever the broker switches
+            // away from "has_rental_units" so stale numbers never
+            // silently ride along on submit.
+            if (v !== 'has_rental_units') {
+              setNumberOfUnits('');
+              setIncomePerUnit('');
+            }
+          }}
+        >
           <Picker.Item label="Select Usage" value="" />
           <Picker.Item label="Has Rental Units (tenants can rent inside)" value="has_rental_units" />
           <Picker.Item label="Residential Only (home to sleep in)" value="residential_only" />
@@ -1470,6 +1521,32 @@ export default function AddProperty() {
           Required — helps buyers know if this property earns rental income
         </Text>
       ) : null}
+
+      {propertyUsage === 'has_rental_units' && (
+        <>
+          <Text style={styles.label}>
+            Number of Units <Text style={{ color: '#e53935' }}>*</Text>
+          </Text>
+          <TextInput
+            style={styles.input}
+            value={numberOfUnits}
+            onChangeText={(text) => setNumberOfUnits(stripToDigits(text))}
+            keyboardType="numeric"
+            placeholder="e.g. 4"
+          />
+
+          <Text style={styles.label}>
+            Income per Unit (UGX/month) <Text style={{ color: '#e53935' }}>*</Text>
+          </Text>
+          <TextInput
+            style={styles.input}
+            value={formatWithCommas(incomePerUnit)}
+            onChangeText={(text) => setIncomePerUnit(stripToDigits(text))}
+            keyboardType="numeric"
+            placeholder="e.g. 300,000"
+          />
+        </>
+      )}
 
       <Text style={styles.label}>Bedroom Type</Text>
       <View style={styles.pickerWrapper}>
@@ -1543,11 +1620,6 @@ export default function AddProperty() {
 
   // =========================
   // LAND FORM
-  // Same layout as Properties-For-Sale form, but:
-  //  - Property Type = Plot / Estate
-  //  - Property Usage = Rentals/Apartments / Residence / Shops
-  //  - No Bedroom Type
-  //  - Owner Name / Owner Number instead of Landlord Name / Number
   // =========================
   const renderLandForm = () => (
     <ScrollView style={styles.scrollContent} keyboardShouldPersistTaps="handled">
@@ -1608,7 +1680,13 @@ export default function AddProperty() {
       <TextInput style={styles.input} value={village} onChangeText={setVillage} placeholder="Enter village" />
 
       <Text style={styles.label}>Price (UGX)</Text>
-      <TextInput style={styles.input} value={price} onChangeText={setPrice} keyboardType="numeric" placeholder="Enter price" />
+      <TextInput
+        style={styles.input}
+        value={formatWithCommas(price)}
+        onChangeText={(text) => setPrice(stripToDigits(text))}
+        keyboardType="numeric"
+        placeholder="Enter price"
+      />
 
       <Text style={styles.label}>Area Type</Text>
       <View style={styles.pickerWrapper}>
@@ -1791,9 +1869,6 @@ export default function AddProperty() {
                   setVideoModal(false);
                   const hasSpace = await checkCacheSize();
                   if (!hasSpace) return;
-                  // Remember which tab we're recording for — this screen may
-                  // re-init when we come back from the camera, and activeTab
-                  // would otherwise reset to the default ('RENT')
                   await AsyncStorage.setItem('pending_tab', activeTab);
                   setTimeout(() => router.push('/(tabs)/camera' as any), 150);
                 }}
@@ -1853,13 +1928,7 @@ export default function AddProperty() {
           </View>
         </Modal>
 
-        {/* VIDEO PREVIEW MODAL
-            Crash fix: only mounted when a real selectedVideo exists,
-            so the native player is never initialised against a
-            placeholder/empty URI. React.memo + a stable onClose
-            (useCallback above) mean typing in the form or the
-            upload progress interval ticking every 500ms no longer
-            forces this to re-render and re-touch the native surface. */}
+        {/* VIDEO PREVIEW MODAL */}
         {selectedVideo && (
           <VideoPreviewModal
             visible={previewModal}
