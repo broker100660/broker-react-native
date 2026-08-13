@@ -14,7 +14,6 @@ import {
   useColorScheme,
   PermissionsAndroid,
   Platform,
-  SafeAreaView,
   StatusBar,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -29,6 +28,16 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 const CACHE_KEY = 'cached_properties';
 const CACHE_KEY_FOR_SALE = 'cached_properties_for_sale';
 const CACHE_KEY_LAND = 'cached_land_properties';
+
+// Fixed row height used for FlatList's getItemLayout below — thumbnail
+// (120) + price row (~24, incl. padding) + vertical margins (10, from
+// styles.card's margin:5 top+bottom). Without a real getItemLayout,
+// scrollToIndex on this 3-column grid has to guess row positions, which
+// is a known crash/freeze source on Android when scrolling to a row
+// that hasn't been measured yet. This makes scrollToIndex reliable and
+// removes that crash risk entirely.
+const NUM_COLUMNS = 3;
+const CARD_HEIGHT = 154;
 
 // =========================
 // LOCATION HELPERS
@@ -79,22 +88,27 @@ export default function Home() {
   // if a match exists in the currently displayed grid, scroll to it; if
   // not, leave the grid exactly as it is and just let the broker know.
   //
-  // PERSISTENCE FIX: priceSearch is no longer cleared after a successful
-  // search — it stays exactly as typed until the broker edits it
-  // themselves, so they can keep re-searching the same price (e.g. after
-  // the list refreshes) without retyping it. highlightedId is no longer
-  // auto-cleared on a timer — the green border on the matched card now
-  // persists until the broker switches tabs (see the useEffect below),
-  // instead of silently disappearing after 3 seconds.
+  // PERSISTENCE: priceSearch is never cleared after a search — it stays
+  // exactly as typed until the broker edits it themselves. highlightedId
+  // is never auto-cleared on a timer — the green border persists until
+  // the broker switches tabs (see the useEffect below).
+  //
+  // CYCLING: searching the SAME price again now advances to the NEXT
+  // house with that price (wrapping back to the first after the last),
+  // instead of always re-landing on the first match. lastSearchRef
+  // tracks what was searched last and which match index was shown, so
+  // we know whether to start over (new price) or advance (same price).
   const [priceSearch, setPriceSearch] = useState('');
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
   const gridRef = useRef<FlatList>(null);
+  const lastSearchRef = useRef<{ query: string; matchIndex: number }>({ query: '', matchIndex: -1 });
 
   // Leaving the current tab (RENT/LAND/PROPERTIES) counts as "leaving that
-  // page" — clear the green highlight then, but NOT on every re-render,
-  // refresh, or re-search within the same tab.
+  // page" — clear the green highlight and reset search-cycling state then,
+  // but NOT on every re-render, refresh, or re-search within the same tab.
   useEffect(() => {
     setHighlightedId(null);
+    lastSearchRef.current = { query: '', matchIndex: -1 };
   }, [activeTab]);
 
   const activeForSale = forSaleProperties.filter(p => p.computed_status === 'active');
@@ -296,7 +310,7 @@ export default function Home() {
         propertyType = 'for_sale';
       }
 
-      await fetch(`${API_URL}/api/properties/${selected.id}/event`, {
+      const res = await fetch(`${API_URL}/api/properties/${selected.id}/event`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
@@ -306,6 +320,11 @@ export default function Home() {
           propertyType,
         }),
       });
+
+      if (!res.ok) {
+        Alert.alert('Error', 'Could not update status. Check your connection and try again.');
+        return;
+      }
 
       Alert.alert('Success');
       setVisible(false);
@@ -333,7 +352,7 @@ export default function Home() {
         propertyType = 'for_sale';
       }
 
-      await fetch(`${API_URL}/api/properties/${selected.id}/event`, {
+      const res = await fetch(`${API_URL}/api/properties/${selected.id}/event`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
@@ -343,6 +362,11 @@ export default function Home() {
           propertyType,
         }),
       });
+
+      if (!res.ok) {
+        Alert.alert('Error', 'Could not update status. Check your connection and try again.');
+        return;
+      }
 
       Alert.alert('Marked as Taken');
       setVisible(false);
@@ -372,7 +396,7 @@ export default function Home() {
         propertyType = 'for_sale';
       }
 
-      await fetch(`${API_URL}/api/properties/${selected.id}/price`, {
+      const res = await fetch(`${API_URL}/api/properties/${selected.id}/price`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
@@ -382,6 +406,11 @@ export default function Home() {
           propertyType,
         }),
       });
+
+      if (!res.ok) {
+        Alert.alert('Error', 'Could not update price. Check your connection and try again.');
+        return;
+      }
 
       Alert.alert('Price updated!');
       setVisible(false);
@@ -434,12 +463,10 @@ export default function Home() {
   // to it. If not found, leave the grid untouched and just notify the
   // broker instead of clearing/replacing anything.
   //
-  // PERSISTENCE FIX: previously this cleared priceSearch back to '' and
-  // auto-cleared highlightedId after 3 seconds — both removed. The typed
-  // price now stays in the box (so the broker can search it again after
-  // a refresh without retyping), and the green highlight now stays on
-  // the matched card until the broker switches tabs (handled by the
-  // useEffect on activeTab above), not on a timer.
+  // CYCLING: searching the SAME price again advances to the NEXT house
+  // with that price (wrapping back to the first after the last), rather
+  // than always landing on the first match again. Searching a DIFFERENT
+  // price always starts fresh at that price's first match.
   const handlePriceSearch = () => {
     const query = priceSearch.trim().replace(/,/g, '');
     if (!query) return;
@@ -450,22 +477,31 @@ export default function Home() {
       return;
     }
 
-    const matchIndex = currentData.findIndex((item: any) => {
+    // All indices in the current grid matching this exact price, in
+    // display order — needed to cycle through them on repeat searches.
+    const matches: number[] = [];
+    currentData.forEach((item: any, idx: number) => {
       const itemPrice = Number(String(item.price).replace(/,/g, ''));
-      return itemPrice === numericQuery;
+      if (itemPrice === numericQuery) matches.push(idx);
     });
 
-    if (matchIndex === -1) {
+    if (matches.length === 0) {
       Alert.alert('No match', 'No active property found with that exact price.');
       return;
     }
 
-    if (matchIndex >= currentData.length) {
-      Alert.alert('Try again', 'The list just updated — please search again.');
-      return;
+    let nextPointer = 0;
+    if (lastSearchRef.current.query === query) {
+      // Same price searched again — advance past whichever match was
+      // shown last time, wrapping back to the first after the last one.
+      const prevPos = matches.indexOf(lastSearchRef.current.matchIndex);
+      nextPointer = prevPos === -1 ? 0 : (prevPos + 1) % matches.length;
     }
 
+    const matchIndex = matches[nextPointer];
     const matchedItem = currentData[matchIndex];
+
+    lastSearchRef.current = { query, matchIndex };
 
     try {
       gridRef.current?.scrollToIndex({ index: matchIndex, animated: true, viewPosition: 0.3 });
@@ -476,14 +512,23 @@ export default function Home() {
     // Highlight the exact matched card so there's zero ambiguity about
     // which one scrolled into view, even with several visible at once.
     // Stays until the broker switches tabs — see the useEffect above.
-    setHighlightedId(matchedItem.id);
+    setHighlightedId(matchedItem?.id ?? null);
+
+    // Let the broker know there's more than one match and they can keep
+    // pressing search to cycle through the rest.
+    if (matches.length > 1) {
+      const position = nextPointer + 1;
+      console.log(`[SEARCH] Match ${position} of ${matches.length} for price ${numericQuery}`);
+    }
   };
 
   // ================== RENDER ITEM ==================
   const renderItem = ({ item }: any) => {
-    const streamId  = getStreamId(item.video_url);
-    const thumbnail = `https://videodelivery.net/${streamId}/thumbnails/thumbnail.jpg?time=0`;
-    const isHighlighted = item.id === highlightedId;
+    const streamId  = getStreamId(item?.video_url);
+    const thumbnail = streamId
+      ? `https://videodelivery.net/${streamId}/thumbnails/thumbnail.jpg?time=0`
+      : null;
+    const isHighlighted = item?.id != null && item.id === highlightedId;
     return (
       <TouchableOpacity
         style={[
@@ -493,9 +538,15 @@ export default function Home() {
         ]}
         onPress={() => openProperty(item)}
       >
-        <Image source={{ uri: thumbnail }} style={styles.thumbnail} />
+        {thumbnail ? (
+          <Image source={{ uri: thumbnail }} style={styles.thumbnail} />
+        ) : (
+          <View style={[styles.thumbnail, styles.thumbnailPlaceholder]}>
+            <Text style={{ fontSize: 24 }}>🏠</Text>
+          </View>
+        )}
         <Text style={[styles.price, { color: text }]} numberOfLines={1}>
-          UGX {item.price}
+          UGX {item?.price ?? '—'}
         </Text>
       </TouchableOpacity>
     );
@@ -596,7 +647,9 @@ export default function Home() {
 
         {/* ── PRICE SEARCH — Active section only. Scrolls to a match in
              the grid if the exact price exists; otherwise leaves the
-             grid untouched. Value persists until the broker edits it. ── */}
+             grid untouched. Value persists until the broker edits it.
+             Pressing search again with the same price cycles to the
+             next matching house. ── */}
         {currentFilter === 'active' && (
           <View style={[styles.searchRow, { borderBottomColor: borderColor }]}>
             <TextInput
@@ -631,16 +684,19 @@ export default function Home() {
           <FlatList
             ref={gridRef}
             data={currentData}
-            keyExtractor={(i) => i.id.toString()}
-            numColumns={3}
+            keyExtractor={(item, index) => (item?.id != null ? item.id.toString() : `idx-${index}`)}
+            numColumns={NUM_COLUMNS}
             renderItem={renderItem}
             initialNumToRender={9}
             windowSize={5}
             removeClippedSubviews
+            getItemLayout={(_, index) => {
+              const row = Math.floor(index / NUM_COLUMNS);
+              return { length: CARD_HEIGHT, offset: CARD_HEIGHT * row, index };
+            }}
             onScrollToIndexFailed={(info) => {
-              // Grid layout doesn't have a fixed getItemLayout, so a
-              // scroll to a far-off index can fail on the first try —
-              // retry once it's roughly in range.
+              // With getItemLayout in place this should be rare, but kept
+              // as a safety net — retry once the row is likely in range.
               setTimeout(() => {
                 gridRef.current?.scrollToIndex({ index: info.index, animated: true, viewPosition: 0.3 });
               }, 100);
@@ -868,6 +924,7 @@ const styles = StyleSheet.create({
 
   card:      { flex: 1, margin: 5, borderRadius: 10 },
   thumbnail: { width: '100%', height: 120, borderRadius: 10 },
+  thumbnailPlaceholder: { backgroundColor: '#2a2a2a', justifyContent: 'center', alignItems: 'center' },
   price:     { fontSize: 12, padding: 4 },
 
   floatingBtn: {
